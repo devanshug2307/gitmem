@@ -1,0 +1,3 @@
+cognee==1.2.2
+fastembed
+python-dotenv
