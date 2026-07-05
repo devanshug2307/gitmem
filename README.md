@@ -15,6 +15,9 @@ $ gitmem ask "why does dns_fallback.py exist?"
   existed). It resolves over DNS-over-HTTPS and pins via socket.getaddrinfo…
 ```
 
+![gitmem knowledge graph of a repo's history](docs/graph.png)
+*A repo's commit history as a knowledge graph — commits, authors, files, and causes as connected entities. All of it in `<repo>/.gitmem/`, all of it local.*
+
 ## Why this exists
 
 Every codebase is an archaeology site. "Why is this flag here?" "What did we decide about auth?" "Who touched the payment retry logic and why?" The answers are in commit messages, docs, and PR descriptions — scattered across years. New teammates burn weeks re-excavating them; the person who knew left in March.
