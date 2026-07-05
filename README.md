@@ -85,7 +85,7 @@ Built with Claude Code (Claude Fable 5) as pair programmer, under human directio
 
 ## Team
 
-Solo build by **Devanshu** ([litelae@gmail.com](mailto:litelae@gmail.com)). Sibling submission (different project, different track): [BlackoutOps](https://github.com/devanshug2307/blackoutops) — Cognee **Cloud** track.
+Built by **Devanshu** ([litelae@gmail.com](mailto:litelae@gmail.com)) and **Divy Goyal**. Sibling submission (different project, different track): [BlackoutOps](https://github.com/devanshug2307/blackoutops) — Cognee **Cloud** track.
 
 ## License
 
