@@ -18,10 +18,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
+import textwrap
+import time
 import webbrowser
 from pathlib import Path
 
@@ -30,16 +34,48 @@ from dotenv import load_dotenv
 HERE = Path(__file__).resolve().parent
 load_dotenv(HERE / ".env")
 
-BOLD, DIM, RESET = "\033[1m", "\033[2m", "\033[0m"
-AMBER, GREEN, RED, BLUE = "\033[33m", "\033[32m", "\033[31m", "\033[34m"
+VERSION = "0.1.0"
+
+# Quiet cognee's structlog console flood (the "[2m2026-…] info …" lines) before
+# cognee is ever imported: cognee.shared.logging_utils.setup_logging() reads the
+# LOG_LEVEL env var at import time. ERROR keeps real failures on screen while
+# hiding info/warning chatter. An explicit LOG_LEVEL from the shell always wins.
+_QUIET_LOGS = not os.environ.get("LOG_LEVEL")
+os.environ.setdefault("LOG_LEVEL", "ERROR")
+
+# ANSI helpers — disabled when NO_COLOR is set or stdout is not a terminal.
+_USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+def _c(code: str) -> str:
+    return code if _USE_COLOR else ""
+
+
+BOLD, DIM, RESET = _c("\033[1m"), _c("\033[2m"), _c("\033[0m")
+AMBER, GREEN, RED, BLUE = _c("\033[33m"), _c("\033[32m"), _c("\033[31m"), _c("\033[34m")
 
 CHAPTER_SIZE = 12          # commits per ingested "history chapter"
 DOC_CANDIDATES = ["README.md", "CONTRIBUTING.md", "ARCHITECTURE.md", "docs/README.md"]
 DOC_CHAR_CAP = 6000
 
 
-def say(tag: str, msg: str, color: str = AMBER) -> None:
-    print(f"{color}{BOLD}gitmem{RESET} {DIM}{tag}{RESET} {msg}")
+def banner() -> None:
+    print(f"\n  🧠 {AMBER}{BOLD}gitmem{RESET} — your repo remembers"
+          f"   {DIM}v{VERSION} · 100% local · built on cognee{RESET}")
+    print(f"  {DIM}{'─' * 64}{RESET}\n")
+
+
+def say(tag: str, msg: str, color: str = AMBER, end: str = "\n") -> None:
+    print(f"  {color}{BOLD}▸{RESET} {DIM}{tag:<9}{RESET} {msg}", end=end, flush=True)
+
+
+def hint(msg: str) -> None:
+    print(f"\n  {DIM}↳ next: {msg}{RESET}\n")
+
+
+def fmt_elapsed(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 60}m {s % 60:02d}s" if s >= 60 else f"{s}s"
 
 
 def repo_root(path: str) -> Path:
@@ -57,6 +93,21 @@ def dataset_for(root: Path) -> str:
     return f"gitmem_{slug}"
 
 
+class _TeardownNoiseFilter(logging.Filter):
+    """Hide aiohttp's end-of-process teardown chatter (logged at ERROR via the
+    asyncio logger when cognee's HTTP session is GC'd after the loop closes).
+    Real errors don't match these strings and still print."""
+
+    _NOISY = ("Unclosed client session", "Unclosed connector")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            msg = str(record.msg)
+        return not any(n in msg for n in self._NOISY)
+
+
 def configure_cognee(root: Path):
     """Local-first: all cognee state lives inside the repo's .gitmem directory."""
     state = root / ".gitmem"
@@ -68,6 +119,21 @@ def configure_cognee(root: Path):
         say("llm", "vertex express bridge active (AQ.… key via aiplatform)", DIM)
 
     import cognee  # imported after env is loaded + litellm patched
+
+    if _QUIET_LOGS:
+        # Belt and braces: cognee's own load_dotenv(override=True) may re-lower
+        # LOG_LEVEL from a .env in the cwd. Raise only the *console* handler
+        # back to ERROR — the rotating log file keeps full detail either way.
+        noise_filter = _TeardownNoiseFilter()
+        # asyncio's logger is where aiohttp's "Unclosed client session" teardown
+        # noise is emitted (loop.call_exception_handler) — filter at the logger
+        # so it survives any later handler reconfiguration.
+        logging.getLogger("asyncio").addFilter(noise_filter)
+        logging.getLogger("aiohttp.client").addFilter(noise_filter)
+        for h in logging.getLogger().handlers:
+            if isinstance(h, logging.StreamHandler) and not isinstance(h, logging.FileHandler):
+                h.setLevel(max(h.level, logging.ERROR))
+                h.addFilter(noise_filter)
 
     cognee.config.system_root_directory(str(state / "system"))
     cognee.config.data_root_directory(str(state / "data"))
@@ -116,6 +182,30 @@ def collect_docs(root: Path) -> list[str]:
     return docs[:3]
 
 
+def item_label(text: str, repo: str) -> str:
+    """Short human label for a memory item, derived from its first line."""
+    first = text.splitlines()[0].strip().rstrip(":")
+    first = first.replace(f"Git history of repository '{repo}', ", "history · ")
+    first = first.replace(f" of repository '{repo}'", "")
+    first = first.replace("Documentation file ", "docs · ")
+    first = first.replace(" (most recent first)", "")
+    return first[:72]
+
+
+def render_answer(text: str, attribution: str) -> None:
+    cols = shutil.get_terminal_size((100, 24)).columns
+    width = min(90, max(40, cols - 8))
+    print(f"\n  {BLUE}╭─{RESET} {BOLD}answer{RESET}")
+    for raw in text.strip().splitlines():
+        raw = raw.rstrip()
+        if not raw:
+            print(f"  {BLUE}│{RESET}")
+            continue
+        for line in textwrap.wrap(raw, width=width):
+            print(f"  {BLUE}│{RESET}  {line}")
+    print(f"  {BLUE}╰─{RESET} {DIM}{attribution}{RESET}")
+
+
 async def cmd_learn(args) -> None:
     root = repo_root(args.repo)
     ds = dataset_for(root)
@@ -123,36 +213,53 @@ async def cmd_learn(args) -> None:
     chapters = collect_chapters(root, args.commits)
     docs = collect_docs(root)
     items = docs + chapters
-    say("learn", f"{len(chapters)} history chapters + {len(docs)} docs → dataset {BOLD}{ds}{RESET} (local)")
+    say("learn", f"{len(chapters)} history chapters + {len(docs)} docs → "
+                 f"dataset {BOLD}{ds}{RESET} {DIM}(local){RESET}")
+    t_start = time.monotonic()
+    w = len(str(len(items)))
     for i, item in enumerate(items, 1):
-        say("remember", f"[{i}/{len(items)}] {item.splitlines()[0][:80]}…", BLUE)
+        say("remember", f"{DIM}[{i:>{w}}/{len(items)}]{RESET} {item_label(item, root.name)}",
+            BLUE, end="")
+        t0 = time.monotonic()
         await cognee.remember(item, dataset_name=ds)
-    say("done", f"{GREEN}the repo has a memory now. Try: gitmem ask \"what is this repo about?\"{RESET}")
+        print(f"  {GREEN}✓{RESET} {DIM}{fmt_elapsed(time.monotonic() - t0)}{RESET}")
+    say("done", f"{GREEN}{len(items)} memories in {fmt_elapsed(time.monotonic() - t_start)}"
+                f" — the repo remembers.{RESET}", GREEN)
+    hint('gitmem ask "what is this repo about?"')
 
 
 async def cmd_ask(args) -> None:
     root = repo_root(args.repo)
+    ds = dataset_for(root)
     cognee = configure_cognee(root)
-    say("recall", f"asking the graph of {root.name}…", BLUE)
-    results = await cognee.recall(args.question, datasets=[dataset_for(root)])
-    answered = False
+    say("recall", f"asking the memory of {BOLD}{root.name}{RESET}…", BLUE)
+    t0 = time.monotonic()
+    results = await cognee.recall(args.question, datasets=[ds])
+    elapsed = fmt_elapsed(time.monotonic() - t0)
+    answer = None
     for r in results:
         d = r if isinstance(r, dict) else getattr(r, "__dict__", {})
         kind = str(d.get("kind") or d.get("search_type") or "")
         if "completion" in kind.lower():
-            print(f"\n{BOLD}{d.get('text') or d.get('value')}{RESET}\n")
-            answered = True
+            answer = str(d.get("text") or d.get("value") or "")
             break
-    if not answered:
-        print(f"\n{DIM}(no answer — run `gitmem learn` first?){RESET}\n")
+    if answer:
+        render_answer(answer, f"recalled from graph memory · {ds} · {elapsed}")
+        hint("gitmem graph  — see the knowledge graph it answered from")
+    else:
+        print(f"\n  {DIM}(no answer — this repo has no memory yet){RESET}")
+        hint("gitmem learn  — ingest history + docs first")
 
 
 async def cmd_improve(args) -> None:
     root = repo_root(args.repo)
     cognee = configure_cognee(root)
     say("improve", "running enrichment pass over the repo's memory…", BLUE)
+    t0 = time.monotonic()
     await cognee.improve(dataset=dataset_for(root))
-    say("done", f"{GREEN}memory enriched — connections strengthened.{RESET}")
+    say("done", f"{GREEN}memory enriched in {fmt_elapsed(time.monotonic() - t0)}"
+                f" — connections strengthened.{RESET}", GREEN)
+    hint('gitmem ask "…"  — answers should be richer now')
 
 
 async def cmd_forget(args) -> None:
@@ -162,20 +269,24 @@ async def cmd_forget(args) -> None:
         sys.exit(f"{RED}refusing without --yes: this permanently wipes {ds}{RESET}")
     cognee = configure_cognee(root)
     receipt = await cognee.forget(dataset=ds)
-    say("forget", f"{GREEN}receipt: {receipt}{RESET}")
+    say("forget", f"{GREEN}receipt: {receipt}{RESET}", GREEN)
     say("forget", "ask it anything now — it honestly won't know.")
+    hint("gitmem learn  — teach it again from scratch")
 
 
 async def cmd_graph(args) -> None:
     root = repo_root(args.repo)
     cognee = configure_cognee(root)
     out = root / ".gitmem" / "graph.html"
+    say("graph", "rendering the knowledge graph…", BLUE)
     await cognee.visualize_graph(destination_file_path=str(out), dataset=dataset_for(root))
-    say("graph", f"{GREEN}{out}{RESET}")
+    say("graph", f"{GREEN}{out}{RESET}", GREEN)
     webbrowser.open(f"file://{out}")
+    hint('gitmem ask "why does <thing> exist?"')
 
 
 def main() -> None:
+    banner()
     p = argparse.ArgumentParser(prog="gitmem", description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--repo", default=".", help="path inside the target git repo (default: .)")
